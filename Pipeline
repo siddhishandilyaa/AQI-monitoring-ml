@@ -1,6 +1,6 @@
 import pandas as pd
 
-input_path = "Aqi_1hr.xlsx"
+input_path = "Data/Aqi_1hr.xlsx"
 
 # load file; read_excel for Excel, read_csv for CSV
 if input_path.lower().endswith((".xlsx", ".xls")):
@@ -22,7 +22,7 @@ df["Datetime"] = pd.to_datetime(
 df = df.dropna(subset=["Datetime"]).sort_values("Datetime").reset_index(drop=True)
 
 # save cleaned output to a new CSV file
-output_path = "Aqi_1hrtimeseries.csv"
+output_path = "Data/Aqi_1hrtimeseries.csv"
 df.to_csv(output_path, index=False)
 print(f"Saved cleaned data to {output_path}")
 
@@ -51,3 +51,185 @@ print(df_full.head(10))
 print(df_full.tail(10))
 print("Total rows:", len(df_full))
 print(df_full.isna().sum())
+
+#Api 
+import requests
+import pandas as pd
+
+LAT = 28.7041
+LON = 77.1025
+
+START_DATE = "2026-01-04"
+END_DATE = "2026-03-03"
+
+url = "https://archive-api.open-meteo.com/v1/archive"
+
+params = {
+    "latitude": LAT,
+    "longitude": LON,
+    "start_date": START_DATE,
+    "end_date": END_DATE,
+    "hourly": "temperature_2m,relativehumidity_2m,windspeed_10m,surface_pressure,weathercode",
+    "timezone": "Asia/Kolkata"
+}
+
+response = requests.get(url, params=params)
+data = response.json()
+
+api_df = pd.DataFrame({
+    "Datetime": data["hourly"]["time"],
+    "temp_c_api": data["hourly"]["temperature_2m"],
+    "humidity_api": data["hourly"]["relativehumidity_2m"],
+    "pressure_api": data["hourly"]["surface_pressure"],
+    "windspeed_kph_api": data["hourly"]["windspeed_10m"],
+    "weathercode": data["hourly"]["weathercode"]
+})
+
+api_df["Datetime"] = pd.to_datetime(api_df["Datetime"])
+def weathercode_to_text(code):
+    if code == 0:
+        return "Clear sky"
+    elif code in [1, 2, 3]:
+        return "Partly cloudy"
+    elif code in [45, 48]:
+        return "Fog"
+    elif code in [51, 53, 55]:
+        return "Drizzle"
+    elif code in [61, 63, 65]:
+        return "Rain"
+    elif code in [80, 81, 82]:
+        return "Rain showers"
+    else:
+        return "Unknown"
+
+api_df["condition_text_api"] = api_df["weathercode"].apply(weathercode_to_text)
+
+# drop weathercode
+api_df = api_df.drop(columns=["weathercode"])
+api_df.to_csv("step3a_openmeteo_hourly.csv", index=False)
+print("Saved: step3a_openmeteo_hourly.csv")
+
+import pandas as pd
+
+# load your step 2 timeline file
+timeline_df = pd.read_csv("Data/step2_timeline.csv")
+
+# make sure Datetime is proper
+timeline_df["Datetime"] = pd.to_datetime(timeline_df["Datetime"], errors="coerce")
+
+# load open-meteo weather file from previous step
+api_df = pd.read_csv("step3a_openmeteo_hourly.csv")
+
+# make sure Datetime is proper
+api_df["Datetime"] = pd.to_datetime(api_df["Datetime"], errors="coerce")
+
+# merge weather into timeline
+merged_df = pd.merge(
+    timeline_df,
+    api_df,
+    on="Datetime",
+    how="left"
+)
+
+# save output
+merged_df.to_csv("step3_openmeteo_merged.csv", index=False)
+
+print("Saved: step3_openmeteo_merged.csv")
+print(merged_df.head())
+print(merged_df.columns.tolist())
+print(merged_df.shape)
+
+#Step 3a
+import pandas as pd
+
+# =========================
+# FILE NAMES
+# =========================
+govt_file = "Govtaqi.csv"
+base_file = "Data/step3_openmeteo_merged.csv"
+output_file = "Data/step3a_weathergovt_merged.csv"
+
+# =========================
+# LOAD FILES
+# =========================
+govt_df = pd.read_csv(govt_file)
+base_df = pd.read_csv(base_file)
+
+# =========================
+# MAKE DATETIME COLUMNS
+# =========================
+# Govt file: assumes Date + time_ist already exist
+if "Datetime" not in govt_df.columns:
+    govt_df["Datetime"] = pd.to_datetime(
+        govt_df["Date"].astype(str).str.strip() + " " + govt_df["time_ist"].astype(str).str.strip(),
+        errors="coerce",
+        dayfirst=True
+    )
+else:
+    govt_df["Datetime"] = pd.to_datetime(govt_df["Datetime"], errors="coerce", dayfirst=True)
+
+# Base file: Open-Meteo merged file
+base_df["Datetime"] = pd.to_datetime(base_df["Datetime"], errors="coerce", dayfirst=True)
+
+# drop bad rows
+govt_df = govt_df.dropna(subset=["Datetime"]).sort_values("Datetime").reset_index(drop=True)
+base_df = base_df.dropna(subset=["Datetime"]).sort_values("Datetime").reset_index(drop=True)
+
+# =========================
+# SHIFT GOVT TIMELINE TO MATCH BASE FILE START
+# =========================
+govt_start = govt_df["Datetime"].min()
+base_start = base_df["Datetime"].min()
+
+time_shift = base_start - govt_start
+govt_df["Datetime_shifted"] = govt_df["Datetime"] + time_shift
+
+print("Govt start:", govt_start)
+print("Base start:", base_start)
+print("Applied shift:", time_shift)
+
+# =========================
+# KEEP ONLY GOVT AQI COLUMNS
+# =========================
+# rename these if your actual govt columns differ
+possible_cols = {
+    "pm2_5_api": "pm2_5_govt",
+    "pm10_api": "pm10_govt",
+    "no2_api": "no2_govt",
+    "co_api": "co_govt",
+    "aqi_index_api": "aqi_index_govt",
+    "pm2_5": "pm2_5_govt",
+    "pm10": "pm10_govt",
+    "no2": "no2_govt",
+    "co": "co_govt",
+    "aqi_index": "aqi_index_govt"
+}
+
+govt_keep = ["Datetime_shifted"]
+rename_map = {}
+
+for old_col, new_col in possible_cols.items():
+    if old_col in govt_df.columns:
+        govt_keep.append(old_col)
+        rename_map[old_col] = new_col
+
+govt_small = govt_df[govt_keep].copy().rename(columns=rename_map)
+govt_small = govt_small.rename(columns={"Datetime_shifted": "Datetime"})
+
+# =========================
+# MERGE
+# =========================
+merged_df = pd.merge(
+    base_df,
+    govt_small,
+    on="Datetime",
+    how="left"
+)
+
+# =========================
+# SAVE
+# =========================
+merged_df.to_csv(output_file, index=False)
+print(f"Saved: {output_file}")
+print(merged_df.head())
+print(merged_df.shape)
