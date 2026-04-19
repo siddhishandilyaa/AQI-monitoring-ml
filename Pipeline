@@ -1,0 +1,53 @@
+import pandas as pd
+
+input_path = "Aqi_1hr.xlsx"
+
+# load file; read_excel for Excel, read_csv for CSV
+if input_path.lower().endswith((".xlsx", ".xls")):
+    df = pd.read_excel(input_path)
+else:
+    df = pd.read_csv(input_path, encoding="utf-8", on_bad_lines="skip")
+
+# normalize column names
+df.columns = df.columns.str.strip()
+
+# combine Date and time_ist into a proper datetime column
+df["Datetime"] = pd.to_datetime(
+    df["Date"].astype(str).str.strip() + " " + df["time_ist"].astype(str).str.strip(),
+    format="%d-%m-%Y %H:%M:%S",
+    errors="coerce"
+)
+
+# drop rows where datetime conversion failed, then sort by the new datetime
+df = df.dropna(subset=["Datetime"]).sort_values("Datetime").reset_index(drop=True)
+
+# save cleaned output to a new CSV file
+output_path = "Aqi_1hrtimeseries.csv"
+df.to_csv(output_path, index=False)
+print(f"Saved cleaned data to {output_path}")
+
+# verify result
+print(df[["Date", "time_ist", "Datetime"]].head())
+print(df.shape)
+
+#Step2
+# create full timeline (hourly)
+# create full timeline (hourly)
+start = df["Datetime"].min().floor("D")
+end = df["Datetime"].max().ceil("D") - pd.Timedelta(hours=1)
+
+full_range = pd.date_range(start=start, end=end, freq="1H")
+timeline = pd.DataFrame({"Datetime": full_range})
+
+# merge your data onto full timeline
+df_full = pd.merge(timeline, df, on="Datetime", how="left")
+
+# save output
+df_full.to_csv("step2_timeline.csv", index=False)
+print("Saved: step2_timeline.csv")
+
+# check
+print(df_full.head(10))
+print(df_full.tail(10))
+print("Total rows:", len(df_full))
+print(df_full.isna().sum())
