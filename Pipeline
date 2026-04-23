@@ -1,4 +1,5 @@
 import pandas as pd
+import numpy as np
 
 input_path = "Data/Aqi_1hr.xlsx"
 
@@ -43,8 +44,8 @@ timeline = pd.DataFrame({"Datetime": full_range})
 df_full = pd.merge(timeline, df, on="Datetime", how="left")
 
 # save output
-df_full.to_csv("step2_timeline.csv", index=False)
-print("Saved: step2_timeline.csv")
+df_full.to_excel("Data/step2_timeline.xlsx", index=False)
+print("Saved: Data/step2_timeline.xlsx")
 
 # check
 print(df_full.head(10))
@@ -52,184 +53,668 @@ print(df_full.tail(10))
 print("Total rows:", len(df_full))
 print(df_full.isna().sum())
 
-#Api 
-import requests
+#Step3
 import pandas as pd
+import numpy as np
+from openpyxl import load_workbook
 
-LAT = 28.7041
-LON = 77.1025
+# ========= FILE PATHS =========
+input_file = "Data/step2_timeline.xlsx"
+output_file = "Data/Step3_filledvalues.xlsx"
 
-START_DATE = "2026-01-04"
-END_DATE = "2026-03-03"
+# ========= READ FILE =========
+df = pd.read_excel(input_file)
 
-url = "https://archive-api.open-meteo.com/v1/archive"
+# ========= CLEAN COLUMN NAMES =========
+df.columns = [str(c).strip() for c in df.columns]
 
-params = {
-    "latitude": LAT,
-    "longitude": LON,
-    "start_date": START_DATE,
-    "end_date": END_DATE,
-    "hourly": "temperature_2m,relativehumidity_2m,windspeed_10m,surface_pressure,weathercode",
-    "timezone": "Asia/Kolkata"
-}
+# ========= REMOVE EXTRA DATE/TIME COLUMNS =========
+# since Datetime already contains both date + time
+df.drop(columns=["Date", "time_ist"], inplace=True, errors="ignore")
 
-response = requests.get(url, params=params)
-data = response.json()
+# ========= COLUMN NAMES =========
+datetime_col = "Datetime"
+pollutant_cols = ["aqi_index", "pm2_5", "pm10", "co", "no2"]
 
-api_df = pd.DataFrame({
-    "Datetime": data["hourly"]["time"],
-    "temp_c_api": data["hourly"]["temperature_2m"],
-    "humidity_api": data["hourly"]["relativehumidity_2m"],
-    "pressure_api": data["hourly"]["surface_pressure"],
-    "windspeed_kph_api": data["hourly"]["windspeed_10m"],
-    "weathercode": data["hourly"]["weathercode"]
+# weather columns only for reference, untouched
+leave_untouched = ["temp_c", "humidity", "pressure_mb", "windspeed_kph", "condition"]
+
+# ========= CHECK REQUIRED COLUMNS =========
+for col in [datetime_col] + pollutant_cols:
+    if col not in df.columns:
+        raise ValueError(f"Column not found: {col}")
+
+# ========= DATETIME PARSING =========
+df[datetime_col] = pd.to_datetime(df[datetime_col], errors="coerce")
+df["hour"] = df[datetime_col].dt.hour
+
+# ========= KEEP ORIGINAL FOR MISSING MASK =========
+original_df = pd.read_excel(input_file)
+original_df.columns = [str(c).strip() for c in original_df.columns]
+original_df.drop(columns=["Date", "time_ist"], inplace=True, errors="ignore")
+
+# ========= HELPER: TIME-OF-DAY BIAS =========
+def get_bias(hour, col):
+    if pd.isna(hour):
+        return 0.0
+
+    # Late night / early morning
+    if 0 <= hour <= 5:
+        bias_map = {
+            "aqi_index": -0.015,
+            "pm2_5": -0.018,
+            "pm10": -0.015,
+            "co": -0.020,
+            "no2": -0.018
+        }
+
+    # Morning build-up
+    elif 6 <= hour <= 9:
+        bias_map = {
+            "aqi_index": 0.010,
+            "pm2_5": 0.012,
+            "pm10": 0.010,
+            "co": 0.008,
+            "no2": 0.012
+        }
+
+    # Afternoon dispersion
+    elif 10 <= hour <= 16:
+        bias_map = {
+            "aqi_index": -0.005,
+            "pm2_5": -0.008,
+            "pm10": -0.006,
+            "co": -0.004,
+            "no2": -0.005
+        }
+
+    # Evening rise
+    elif 17 <= hour <= 21:
+        bias_map = {
+            "aqi_index": 0.012,
+            "pm2_5": 0.015,
+            "pm10": 0.013,
+            "co": 0.014,
+            "no2": 0.016
+        }
+
+    else:
+        bias_map = {c: 0.0 for c in pollutant_cols}
+
+    return bias_map.get(col, 0.0)
+
+# ========= STEP 1: BASE INTERPOLATION =========
+for col in pollutant_cols:
+    df[col] = pd.to_numeric(df[col], errors="coerce")
+    df[col] = df[col].interpolate(method="linear", limit_direction="both")
+
+# ========= STEP 2: TIME-AWARE ADJUSTMENT ONLY ON ORIGINAL NaNs =========
+for col in pollutant_cols:
+    original_missing = pd.to_numeric(original_df[col], errors="coerce").isna()
+
+    for i in df.index[original_missing]:
+        hour = df.at[i, "hour"]
+        base_val = df.at[i, col]
+
+        if pd.isna(base_val):
+            continue
+
+        prev_val = df.at[i - 1, col] if i - 1 in df.index else base_val
+        next_val = df.at[i + 1, col] if i + 1 in df.index else base_val
+        local_trend = ((prev_val + next_val) / 2) - base_val
+
+        bias = get_bias(hour, col)
+
+        noise_scale = max(abs(base_val) * 0.01, 0.5)
+        noise = np.random.uniform(-noise_scale, noise_scale) * 0.35
+
+        adjusted = base_val * (1 + bias) + 0.2 * local_trend + noise
+        df.at[i, col] = adjusted
+
+# ========= STEP 3: ENFORCE RELATIONS =========
+# pm10 should usually be >= pm2_5
+for i in df.index:
+    if pd.notna(df.at[i, "pm2_5"]) and pd.notna(df.at[i, "pm10"]):
+        if df.at[i, "pm10"] < df.at[i, "pm2_5"]:
+            df.at[i, "pm10"] = df.at[i, "pm2_5"] + np.random.uniform(2, 8)
+
+# AQI softly follows PM trend
+for i in df.index:
+    if pd.notna(df.at[i, "pm2_5"]) and pd.notna(df.at[i, "pm10"]):
+        pm25 = df.at[i, "pm2_5"]
+        pm10 = df.at[i, "pm10"]
+
+        estimated_aqi = 0.55 * pm25 + 0.35 * pm10 + 60
+        current_aqi = df.at[i, "aqi_index"]
+
+        if pd.notna(current_aqi):
+            df.at[i, "aqi_index"] = 0.7 * current_aqi + 0.3 * estimated_aqi
+
+# ========= STEP 4: SMOOTH FILLED PARTS ONLY =========
+for col in pollutant_cols:
+    original_missing = pd.to_numeric(original_df[col], errors="coerce").isna()
+    smooth_series = df[col].rolling(window=3, center=True, min_periods=1).mean()
+
+    for i in df.index[original_missing]:
+        df.at[i, col] = 0.6 * df.at[i, col] + 0.4 * smooth_series.at[i]
+
+# ========= STEP 5: CLIP NEGATIVE VALUES =========
+for col in pollutant_cols:
+    df[col] = df[col].clip(lower=0)
+
+# ========= STEP 6: ROUND TO 2 DECIMALS =========
+for col in pollutant_cols:
+    df[col] = df[col].round(2)
+
+# ========= DROP TEMP HOUR COLUMN =========
+df.drop(columns=["hour"], inplace=True)
+
+# ========= SAVE TO EXCEL =========
+df.to_excel(output_file, index=False)
+
+# ========= AUTO-INCREASE COLUMN WIDTH =========
+wb = load_workbook(output_file)
+ws = wb.active
+
+for col in ws.columns:
+    max_length = 0
+    col_letter = col[0].column_letter
+
+    for cell in col:
+        try:
+            if cell.value is not None:
+                max_length = max(max_length, len(str(cell.value)))
+        except:
+            pass
+
+    ws.column_dimensions[col_letter].width = max_length + 2
+
+wb.save(output_file)
+
+print(f"Done. Saved file as: {output_file}")
+
+#Step4
+import pandas as pd
+import numpy as np
+from openpyxl import load_workbook
+
+# =========================================================
+# FILE PATHS
+# =========================================================
+main_file = "Data/Step3_filledvalues.xlsx"
+weather_file = "Pressure.xlsx"
+output_file = "Data/Step4_pressure.xlsx"
+
+# =========================================================
+# READ FILES
+# =========================================================
+main_df = pd.read_excel(main_file)
+weather_df = pd.read_excel(weather_file)
+
+main_df.columns = [str(c).strip() for c in main_df.columns]
+weather_df.columns = [str(c).strip() for c in weather_df.columns]
+
+# =========================================================
+# DATETIME PARSING
+# =========================================================
+main_df["Datetime"] = pd.to_datetime(main_df["Datetime"], errors="coerce")
+weather_df["time"] = pd.to_datetime(weather_df["time"], dayfirst=True, errors="coerce")
+
+# =========================================================
+# 🔥 IMPORTANT: MERGE BY MONTH-DAY-HOUR (2025 vs 2026 issue)
+# =========================================================
+main_df["merge_key"] = main_df["Datetime"].dt.strftime("%m-%d %H:%M:%S")
+weather_df["merge_key"] = weather_df["time"].dt.strftime("%m-%d %H:%M:%S")
+
+# rename weather columns
+weather_df = weather_df.rename(columns={
+    "temp_c": "temp_ref",
+    "humidity": "humidity_ref",
+    "windspeed_kph": "wind_ref"
 })
 
-api_df["Datetime"] = pd.to_datetime(api_df["Datetime"])
-def weathercode_to_text(code):
-    if code == 0:
-        return "Clear sky"
-    elif code in [1, 2, 3]:
-        return "Partly cloudy"
-    elif code in [45, 48]:
-        return "Fog"
-    elif code in [51, 53, 55]:
-        return "Drizzle"
-    elif code in [61, 63, 65]:
-        return "Rain"
-    elif code in [80, 81, 82]:
-        return "Rain showers"
-    else:
-        return "Unknown"
+weather_df = weather_df[["merge_key", "temp_ref", "humidity_ref", "wind_ref"]]
 
-api_df["condition_text_api"] = api_df["weathercode"].apply(weathercode_to_text)
+# merge
+df = main_df.merge(weather_df, on="merge_key", how="left")
 
-# drop weathercode
-api_df = api_df.drop(columns=["weathercode"])
-api_df.to_csv("step3a_openmeteo_hourly.csv", index=False)
-print("Saved: step3a_openmeteo_hourly.csv")
+# =========================================================
+# 🎯 SMALL CORRECTION FUNCTION (NO FAKE JUMPS)
+# =========================================================
+def small_correction(sensor, ref, col):
+    if pd.isna(sensor) and pd.notna(ref):
+        return ref  # fill blank directly
 
-import pandas as pd
+    if pd.notna(sensor) and pd.notna(ref):
+        diff = ref - sensor
 
-# load your step 2 timeline file
-timeline_df = pd.read_csv("Data/step2_timeline.csv")
+        # VERY SMALL influence (2–5%)
+        corrected = sensor + 0.02 * diff
 
-# make sure Datetime is proper
-timeline_df["Datetime"] = pd.to_datetime(timeline_df["Datetime"], errors="coerce")
+        # HARD LIMITS (prevent unrealistic jump)
+        if col == "temp_c":
+            corrected = max(min(corrected, sensor + 1), sensor - 1)
 
-# load open-meteo weather file from previous step
-api_df = pd.read_csv("step3a_openmeteo_hourly.csv")
+        elif col == "humidity":
+            corrected = max(min(corrected, sensor + 5), sensor - 5)
 
-# make sure Datetime is proper
-api_df["Datetime"] = pd.to_datetime(api_df["Datetime"], errors="coerce")
+        elif col == "windspeed_kph":
+            corrected = max(min(corrected, sensor + 2), sensor - 2)
 
-# merge weather into timeline
-merged_df = pd.merge(
-    timeline_df,
-    api_df,
-    on="Datetime",
-    how="left"
-)
+        return corrected
 
-# save output
-merged_df.to_csv("step3_openmeteo_merged.csv", index=False)
+    return sensor
 
-print("Saved: step3_openmeteo_merged.csv")
-print(merged_df.head())
-print(merged_df.columns.tolist())
-print(merged_df.shape)
-
-#Step 3a
-import pandas as pd
-
-# =========================
-# FILE NAMES
-# =========================
-govt_file = "Govtaqi.csv"
-base_file = "Data/step3_openmeteo_merged.csv"
-output_file = "Data/step3a_weathergovt_merged.csv"
-
-# =========================
-# LOAD FILES
-# =========================
-govt_df = pd.read_csv(govt_file)
-base_df = pd.read_csv(base_file)
-
-# =========================
-# MAKE DATETIME COLUMNS
-# =========================
-# Govt file: assumes Date + time_ist already exist
-if "Datetime" not in govt_df.columns:
-    govt_df["Datetime"] = pd.to_datetime(
-        govt_df["Date"].astype(str).str.strip() + " " + govt_df["time_ist"].astype(str).str.strip(),
-        errors="coerce",
-        dayfirst=True
-    )
-else:
-    govt_df["Datetime"] = pd.to_datetime(govt_df["Datetime"], errors="coerce", dayfirst=True)
-
-# Base file: Open-Meteo merged file
-base_df["Datetime"] = pd.to_datetime(base_df["Datetime"], errors="coerce", dayfirst=True)
-
-# drop bad rows
-govt_df = govt_df.dropna(subset=["Datetime"]).sort_values("Datetime").reset_index(drop=True)
-base_df = base_df.dropna(subset=["Datetime"]).sort_values("Datetime").reset_index(drop=True)
-
-# =========================
-# SHIFT GOVT TIMELINE TO MATCH BASE FILE START
-# =========================
-govt_start = govt_df["Datetime"].min()
-base_start = base_df["Datetime"].min()
-
-time_shift = base_start - govt_start
-govt_df["Datetime_shifted"] = govt_df["Datetime"] + time_shift
-
-print("Govt start:", govt_start)
-print("Base start:", base_start)
-print("Applied shift:", time_shift)
-
-# =========================
-# KEEP ONLY GOVT AQI COLUMNS
-# =========================
-# rename these if your actual govt columns differ
-possible_cols = {
-    "pm2_5_api": "pm2_5_govt",
-    "pm10_api": "pm10_govt",
-    "no2_api": "no2_govt",
-    "co_api": "co_govt",
-    "aqi_index_api": "aqi_index_govt",
-    "pm2_5": "pm2_5_govt",
-    "pm10": "pm10_govt",
-    "no2": "no2_govt",
-    "co": "co_govt",
-    "aqi_index": "aqi_index_govt"
+# =========================================================
+# APPLY CORRECTION
+# =========================================================
+cols_map = {
+    "temp_c": "temp_ref",
+    "humidity": "humidity_ref",
+    "windspeed_kph": "wind_ref"
 }
 
-govt_keep = ["Datetime_shifted"]
+for col, ref_col in cols_map.items():
+    df[col] = pd.to_numeric(df[col], errors="coerce")
+    df[ref_col] = pd.to_numeric(df[ref_col], errors="coerce")
+
+    new_vals = []
+
+    for i in range(len(df)):
+        sensor = df.loc[i, col]
+        ref = df.loc[i, ref_col]
+
+        new_val = small_correction(sensor, ref, col)
+
+        # 🔥 EXTRA: continuity smoothing (neighbor check)
+        if i > 0 and pd.notna(new_val):
+            prev = df.loc[i - 1, col]
+            if pd.notna(prev):
+                # don't allow jump > threshold
+                if col == "temp_c":
+                    new_val = max(min(new_val, prev + 1), prev - 1)
+
+                elif col == "humidity":
+                    new_val = max(min(new_val, prev + 6), prev - 6)
+
+                elif col == "windspeed_kph":
+                    new_val = max(min(new_val, prev + 2), prev - 2)
+
+        new_vals.append(new_val)
+
+    df[col] = new_vals
+
+# =========================================================
+# ROUND VALUES
+# =========================================================
+for col in ["temp_c", "humidity", "windspeed_kph"]:
+    df[col] = pd.to_numeric(df[col], errors="coerce").round(2)
+
+# =========================================================
+# CLEANUP
+# =========================================================
+df.drop(columns=["merge_key", "temp_ref", "humidity_ref", "wind_ref"], inplace=True)
+
+# =========================================================
+# SAVE
+# =========================================================
+df.to_excel(output_file, index=False)
+
+# =========================================================
+# AUTO COLUMN WIDTH
+# =========================================================
+wb = load_workbook(output_file)
+ws = wb.active
+
+for col_cells in ws.columns:
+    max_len = 0
+    col_letter = col_cells[0].column_letter
+    for cell in col_cells:
+        if cell.value is not None:
+            max_len = max(max_len, len(str(cell.value)))
+    ws.column_dimensions[col_letter].width = max_len + 2
+
+wb.save(output_file)
+
+print(f"Done. Saved file as: {output_file}")
+
+#Step4a
+import pandas as pd
+from openpyxl import load_workbook
+
+# =========================
+# FILE PATHS
+# =========================
+main_file = "Data/Step4_pressure.xlsx"   # main file
+govt_file = "aqi_output.xlsx"    # govt file
+output_file = "Data/Step4a_merged.xlsx"
+
+# =========================
+# READ FILES
+# =========================
+main_df = pd.read_excel(main_file)
+govt_df = pd.read_excel(govt_file)
+
+main_df.columns = [str(c).strip() for c in main_df.columns]
+govt_df.columns = [str(c).strip() for c in govt_df.columns]
+
+# =========================
+# CLEAN / RENAME GOVT HEADERS
+# =========================
 rename_map = {}
+for col in govt_df.columns:
+    c = str(col).strip().lower()
 
-for old_col, new_col in possible_cols.items():
-    if old_col in govt_df.columns:
-        govt_keep.append(old_col)
-        rename_map[old_col] = new_col
+    if c in ["pm10", "pm_10"]:
+        rename_map[col] = "pm10_govt"
+    elif c in ["pm2_5", "pm25", "pm2.5"]:
+        rename_map[col] = "pm2_5_govt"
+    elif c == "co":
+        rename_map[col] = "co_govt"
+    elif c == "no2":
+        rename_map[col] = "no2_govt"
+    elif c in ["aqi", "aqi_index"]:
+        rename_map[col] = "aqi_govt"
 
-govt_small = govt_df[govt_keep].copy().rename(columns=rename_map)
-govt_small = govt_small.rename(columns={"Datetime_shifted": "Datetime"})
+govt_df = govt_df.rename(columns=rename_map)
+
+required_govt_cols = ["pm2_5_govt", "pm10_govt", "co_govt", "no2_govt", "aqi_govt" ]
+for col in required_govt_cols:
+    if col not in govt_df.columns:
+        raise ValueError(f"Govt file missing column: {col}")
+
+# keep only needed govt columns
+govt_df = govt_df[required_govt_cols].copy()
 
 # =========================
-# MERGE
+# ADD EMPTY GOVT COLUMNS IN MAIN FILE IF NOT PRESENT
 # =========================
-merged_df = pd.merge(
-    base_df,
-    govt_small,
-    on="Datetime",
-    how="left"
-)
+for col in required_govt_cols:
+    if col not in main_df.columns:
+        main_df[col] = pd.NA
+
+# =========================
+# PUT GOVT VALUES INTO NEW GOVT COLUMNS FROM START
+# =========================
+rows_to_fill = min(len(main_df), len(govt_df))
+
+for col in required_govt_cols:
+    main_df.loc[:rows_to_fill - 1, col] = pd.to_numeric(
+        govt_df.loc[:rows_to_fill - 1, col], errors="coerce"
+    ).values
+
+# =========================
+# ROUND
+# =========================
+for col in required_govt_cols:
+    main_df[col] = pd.to_numeric(main_df[col], errors="coerce").round(2)
+
+# =========================
+# OPTIONAL: PLACE GOVT COLUMNS NEXT TO MAIN POLLUTANT COLUMNS
+# =========================
+desired_order = [
+    "Datetime",
+    "temp_c",
+    "humidity",
+    "windspeed_kph",
+    "condition_text",
+    "aqi_index",
+    "aqi_govt",
+    "pm2_5",
+    "pm2_5_govt",
+    "pm10",
+    "pm10_govt",
+    "co",
+    "co_govt",
+    "no2",
+    "no2_govt"
+]
+
+# keep only columns that exist + append any extras at end
+final_cols = [c for c in desired_order if c in main_df.columns] + [c for c in main_df.columns if c not in desired_order]
+main_df = main_df[final_cols]
 
 # =========================
 # SAVE
 # =========================
-merged_df.to_csv(output_file, index=False)
-print(f"Saved: {output_file}")
-print(merged_df.head())
-print(merged_df.shape)
+main_df.to_excel(output_file, index=False)
+
+# =========================
+# AUTO COLUMN WIDTH
+# =========================
+wb = load_workbook(output_file)
+ws = wb.active
+
+for col_cells in ws.columns:
+    max_len = 0
+    col_letter = col_cells[0].column_letter
+    for cell in col_cells:
+        if cell.value is not None:
+            max_len = max(max_len, len(str(cell.value)))
+    ws.column_dimensions[col_letter].width = max_len + 2
+
+wb.save(output_file)
+
+print(f"Done. Saved: {output_file}")
+
+#Step5
+import pandas as pd
+import numpy as np
+from openpyxl import load_workbook
+
+# ==========================================
+# FILE PATHS
+# ==========================================
+input_file = "Data/Step4a_merged.xlsx"
+output_file = "Data/Final_merged.xlsx"
+
+# ==========================================
+# READ FILE
+# ==========================================
+df = pd.read_excel(input_file)
+df.columns = [str(c).strip() for c in df.columns]
+
+# ==========================================
+# REQUIRED COLUMNS
+# ==========================================
+required_cols = [
+    "pm2_5", "pm2_5_govt",
+    "pm10", "pm10_govt",
+    "co", "co_govt",
+    "no2", "no2_govt"
+]
+
+for col in required_cols:
+    if col not in df.columns:
+        raise ValueError(f"Missing column: {col}")
+
+# ==========================================
+# MAKE NUMERIC
+# ==========================================
+for col in required_cols:
+    df[col] = pd.to_numeric(df[col], errors="coerce")
+
+# ==========================================
+# BOUNDED MERGE FUNCTION
+# ==========================================
+def bounded_merge(sensor, govt, col):
+    if pd.isna(sensor) and pd.notna(govt):
+        return govt
+
+    if pd.notna(sensor) and pd.isna(govt):
+        return sensor
+
+    if pd.isna(sensor) and pd.isna(govt):
+        return np.nan
+
+    diff = govt - sensor
+
+    # small correction fraction
+    merged = sensor + 0.15 * diff
+
+    # hard caps so value doesn't jump unrealistically
+    if col == "pm2_5":
+        merged = max(min(merged, sensor + 15), sensor - 15)
+
+    elif col == "pm10":
+        merged = max(min(merged, sensor + 18), sensor - 18)
+
+    elif col == "co":
+        merged = max(min(merged, sensor + 120), sensor - 120)
+
+    elif col == "no2":
+        merged = max(min(merged, sensor + 8), sensor - 8)
+
+    return merged
+
+# ==========================================
+# CREATE MERGED COLUMNS
+# ==========================================
+df["pm2_5_merge"] = [
+    bounded_merge(s, g, "pm2_5")
+    for s, g in zip(df["pm2_5"], df["pm2_5_govt"])
+]
+
+df["pm10_merge"] = [
+    bounded_merge(s, g, "pm10")
+    for s, g in zip(df["pm10"], df["pm10_govt"])
+]
+
+df["co_merge"] = [
+    bounded_merge(s, g, "co")
+    for s, g in zip(df["co"], df["co_govt"])
+]
+
+df["no2_merge"] = [
+    bounded_merge(s, g, "no2")
+    for s, g in zip(df["no2"], df["no2_govt"])
+]
+
+# ==========================================
+# OPTIONAL CONTINUITY SMOOTHING
+# prevents sudden hour-to-hour jump
+# ==========================================
+def smooth_series(series, max_step):
+    values = series.copy().tolist()
+
+    for i in range(1, len(values)):
+        prev = values[i - 1]
+        curr = values[i]
+
+        if pd.notna(prev) and pd.notna(curr):
+            if curr > prev + max_step:
+                values[i] = prev + max_step
+            elif curr < prev - max_step:
+                values[i] = prev - max_step
+
+    return pd.Series(values, index=series.index)
+
+df["pm2_5_merge"] = smooth_series(df["pm2_5_merge"], max_step=20)
+df["pm10_merge"] = smooth_series(df["pm10_merge"], max_step=22)
+df["co_merge"] = smooth_series(df["co_merge"], max_step=150)
+df["no2_merge"] = smooth_series(df["no2_merge"], max_step=10)
+
+# ==========================================
+# AQI CALCULATION FROM MERGED PM VALUES
+# CPCB breakpoint logic
+# ==========================================
+def calc_subindex_pm25(c):
+    if pd.isna(c):
+        return None
+
+    bp = [
+        (0, 30, 0, 50),
+        (31, 60, 51, 100),
+        (61, 90, 101, 200),
+        (91, 120, 201, 300),
+        (121, 250, 301, 400),
+        (251, 1000, 401, 500),
+    ]
+
+    for blo, bhi, ilo, ihi in bp:
+        if blo <= c <= bhi:
+            return ((ihi - ilo) / (bhi - blo)) * (c - blo) + ilo
+    return None
+
+def calc_subindex_pm10(c):
+    if pd.isna(c):
+        return None
+
+    bp = [
+        (0, 50, 0, 50),
+        (51, 100, 51, 100),
+        (101, 250, 101, 200),
+        (251, 350, 201, 300),
+        (351, 430, 301, 400),
+        (431, 1000, 401, 500),
+    ]
+
+    for blo, bhi, ilo, ihi in bp:
+        if blo <= c <= bhi:
+            return ((ihi - ilo) / (bhi - blo)) * (c - blo) + ilo
+    return None
+
+def final_aqi(pm25, pm10):
+    aqi25 = calc_subindex_pm25(pm25)
+    aqi10 = calc_subindex_pm10(pm10)
+
+    vals = [v for v in [aqi25, aqi10] if v is not None]
+    return max(vals) if vals else np.nan
+
+df["aqi_merge"] = [
+    final_aqi(pm25, pm10)
+    for pm25, pm10 in zip(df["pm2_5_merge"], df["pm10_merge"])
+]
+
+# ==========================================
+# CONDITION TEXT FROM MERGED AQI
+# ==========================================
+def get_condition(aqi):
+    if pd.isna(aqi):
+        return ""
+    elif aqi <= 50:
+        return "Good"
+    elif aqi <= 100:
+        return "Satisfactory"
+    elif aqi <= 200:
+        return "Moderate"
+    elif aqi <= 300:
+        return "Poor"
+    elif aqi <= 400:
+        return "Very Poor"
+    else:
+        return "Severe"
+
+df["condition_text_merge"] = df["aqi_merge"].apply(get_condition)
+
+# ==========================================
+# ROUND
+# ==========================================
+round_cols = [
+    "pm2_5_merge", "pm10_merge", "co_merge", "no2_merge", "aqi_merge"
+]
+for col in round_cols:
+    df[col] = pd.to_numeric(df[col], errors="coerce").round(2)
+
+# ==========================================
+# SAVE
+# ==========================================
+df.to_excel(output_file, index=False)
+
+# ==========================================
+# AUTO COLUMN WIDTH
+# ==========================================
+wb = load_workbook(output_file)
+ws = wb.active
+
+for col_cells in ws.columns:
+    max_len = 0
+    col_letter = col_cells[0].column_letter
+    for cell in col_cells:
+        if cell.value is not None:
+            max_len = max(max_len, len(str(cell.value)))
+    ws.column_dimensions[col_letter].width = max_len + 2
+
+wb.save(output_file)
+
+print(f"Done. Saved file as: {output_file}")
